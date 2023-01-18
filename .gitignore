@@ -196,3 +196,9 @@ camera_paths/
 vis_results/
 W/
 *.ply
+
+requirements.txt
+debug_shell/
+omnidata/
+Hierarchical-Localization/
+forward_port.sh

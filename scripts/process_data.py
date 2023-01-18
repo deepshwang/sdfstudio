@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 import tyro
+from mpl_toolkits.mplot3d import Axes3D
 from rich.console import Console
 from typing_extensions import Annotated, Literal
 
@@ -18,13 +20,14 @@ from nerfstudio.process_data import (
     colmap_utils,
     hloc_utils,
     insta360_utils,
+    kitti360_utils,
     metashape_utils,
     polycam_utils,
     process_data_utils,
     record3d_utils,
 )
 from nerfstudio.process_data.process_data_utils import CAMERA_MODELS
-from nerfstudio.utils import install_checks
+from nerfstudio.utils import install_checks, pose_visualizer
 
 CONSOLE = Console(width=120)
 
@@ -710,6 +713,171 @@ class ProcessMetashape:
         CONSOLE.rule()
 
 
+@dataclass
+class ProcessKITTI360:
+    """Process KITTI360 data into a nerfstudio dataset.
+
+    This script aims to find scene bounds by reconstructing sparse model using known camera intrinsics/extrinsics.
+    Opposed to many datasets that define the scene boundary using camera poses, driving scene like KITTI-360
+    cannot be bounded by camera poses, as images are collected from cameras with forward-facing FOVs.
+
+    This script does the following:
+
+    1. Reconstruct sparse model of a subset of a sequence using COLMAP
+    2. Determine the scene boundary with margins set as hyperparameter of this class.
+    """
+
+    data: Path
+    """Path the data. e.g., "~/~/KITTI-360"""
+    output_dir: Path
+    """Path to the output directory. e.g., "~/~/KITTI-360"""
+    start_img_id: int
+    """start image id to subsample (required)"""
+    end_img_id: int
+    """end image id to subsample (required)"""
+    seq_id: Literal[0, 2, 3, 4, 5, 6, 7, 9, 10] = 0
+    """sequence id to subsample from (required)"""
+    stereo_id: int = -1
+    """stereo id. -1 (default) is to use both camera 0 and camera 1"""
+    matching_method: Literal["exhaustive", "sequential", "vocab_tree"] = "vocab_tree"
+    """Feature matching method to use. Vocab tree is recommended for a balance of speed and
+        accuracy. Exhaustive is slower but more accurate. Sequential is faster but should only be used for videos."""
+    colmap_cmd: str = "colmap"
+    """How to call the COLMAP executable."""
+    gpu: bool = True
+    """If True, use GPU."""
+    verbose: bool = False
+    """If True, print extra logging."""
+
+    def main(self) -> None:
+        ### [1] Check COLMAP installation
+        install_checks.check_colmap_installed()
+
+        ### [2] subsample & save frames using start/end image ids given a sequence id
+        # monocular cues (depth, normal) are also saved from here.
+        output_dir = self.output_dir / "seq_{}/stereo_{}_{}-{}".format(
+            str(self.seq_id).zfill(4),
+            str(self.stereo_id),
+            str(self.start_img_id).zfill(10),
+            str(self.end_img_id).zfill(10),
+        )
+        cam2worlds, Ks, image_names = kitti360_utils.split_and_save(
+            self.data, output_dir, self.seq_id, self.stereo_id, self.start_img_id, self.end_img_id, extract_priors=False
+        )
+
+        ### [3] Parse data for COLMAP
+        colmap_dir = output_dir / "colmap"
+        recon_colmap_dir = output_dir / "colmap_recon"
+        kitti360_utils.parse_camera_to_colmap(cam2worlds, Ks, image_names, colmap_dir)
+
+        ### [4] Run COLMAP with known poses to retrieve sparsely reconstructed points
+        ### Refer to https://colmap.github.io/faq.html (Sec. Reconstruct sparse/dense model from known camera poses)
+        colmap_utils.run_colmap_with_known_camera_poses(
+            colmap_dir, recon_colmap_dir, output_dir / "image", self.colmap_cmd, self.matching_method, self.verbose
+        )
+
+        ### [5] Normalize the scene (sparsely reconstructed points + camera poses) to unit cube
+        _, images, points3d = colmap_utils.read_model(recon_colmap_dir)
+        cameras, _, _ = colmap_utils.read_model(colmap_dir)
+
+        xyz3d = np.stack([p.xyz for p in list(points3d.values())])
+        rgb3d = np.stack([p.rgb for p in list(points3d.values())])
+        # Calculate T^{cam}_{world} (map points from 'world2cam')
+        world2cams = np.linalg.inv(cam2worlds)
+        camxyz = cam2worlds[:, :3, 3]
+        all_points = np.concatenate((xyz3d, camxyz), axis=0)
+        # Plot camera for sanity check
+        min_camxyz = np.min(camxyz, axis=0)
+        max_camxyz = np.max(camxyz, axis=0)
+        plotter = pose_visualizer.CameraPoseVisualizer(
+            xlim=[min_camxyz[0] - 5, max_camxyz[0] + 5],
+            ylim=[min_camxyz[1] - 5, max_camxyz[1] + 5],
+            zlim=[min_camxyz[2] - 5, max_camxyz[2] + 5],
+            elev_azim=(30, 80),
+        )
+        for i, cam2world in enumerate(cam2worlds):
+            plotter.extrinsic2pyramid(cam2world, focal_len_scaled=5, color=i / cam2worlds.shape[0])
+        plotter.colorbar(cam2worlds.shape[0])
+        plotter.save(recon_colmap_dir / "camera_path_only.png")
+
+        # plot sfm points along with camera paths for sanity check
+        min_points = np.percentile(all_points, q=0.1, axis=0)
+        max_points = np.percentile(all_points, q=99.9, axis=0)
+        plotter = pose_visualizer.CameraPoseVisualizer(
+            xlim=[min_points[0] - 5, max_points[0] + 5],
+            ylim=[min_points[1] - 5, max_points[1] + 5],
+            zlim=[min_points[2] - 5, max_points[2] + 5],
+            elev_azim=(30, 120),
+        )
+
+        for i, cam2world in enumerate(cam2worlds):
+            plotter.extrinsic2pyramid(cam2world, focal_len_scaled=3.0, color=i / cam2worlds.shape[0])
+        plotter.add_points(rgb3d, xyz3d)
+        plotter.save(recon_colmap_dir / "points_and_camera.png")
+
+        # Find bounding box and normalize accordingly
+        # Slight reference of monosdf preprocessing
+        # (https://github.com/autonomousvision/monosdf/blob/main/preprocess/scannet_to_monosdf.py)
+        min_vertices_w = np.percentile(all_points, q=0.1, axis=0)
+        h_min_vertices_w = np.ones((4,))
+        h_min_vertices_w[:3] = min_vertices_w
+
+        max_vertices_w = np.percentile(all_points, q=99.9, axis=0)
+        h_max_vertices_w = np.ones((4,))
+        h_max_vertices_w[:3] = max_vertices_w
+
+        center_w = (min_vertices_w + max_vertices_w) / 2.0
+        scale = 1.0 / (np.max(max_vertices_w - min_vertices_w))
+        # scale = 1
+
+        world2scaled = np.eye(4).astype(
+            np.float32
+        )  # matrix that projects the point expressed in scaled world coordinate to world
+        world2scaled[:3, 3] = -center_w
+        world2scaled[:3] *= scale
+        scaled2world = np.linalg.inv(world2scaled)  # matrix that projects point in world to scaled coordinate
+
+        cam2scaleds = world2scaled @ cam2worlds
+
+        h_min_vertices_scaled = world2scaled @ h_min_vertices_w
+        h_max_vertices_scaled = world2scaled @ h_max_vertices_w
+        min_vertices_scaled = h_min_vertices_scaled[:3] / h_min_vertices_scaled[3]
+        max_vertices_scaled = h_max_vertices_scaled[:3] / h_max_vertices_scaled[3]
+
+        # plot sfm points along with camera paths in scaled world for sanity check
+        plotter = pose_visualizer.CameraPoseVisualizer(
+            xlim=[-1, 1],
+            ylim=[-1, 1],
+            zlim=[-1, 1],
+            elev_azim=(30, 120),
+        )
+
+        for i, cam2scaled in enumerate(cam2scaleds):
+            plotter.extrinsic2pyramid(cam2scaled, focal_len_scaled=0.5, color=i / cam2scaleds.shape[0])
+        h_xyz3d = np.concatenate((xyz3d, np.ones((xyz3d.shape[0], 1))), axis=1)
+        h_xyz3d_scaled = h_xyz3d @ np.transpose(world2scaled)
+        xyz3d_scaled = h_xyz3d_scaled[:, :3] / h_xyz3d_scaled[:, 3:]
+        plotter.add_points(rgb3d, xyz3d_scaled)
+        plotter.save(recon_colmap_dir / "scaled_points_and_camera.png")
+
+        # Save camera parameters / scene bounds
+        cameras = {}
+        for i, cam2scaled in enumerate(cam2scaleds):
+            cam_id = images[i + 1].camera_id
+            K = Ks[cam_id - 1]
+            cameras["scaled2world_%d" % (i)] = scaled2world
+            cameras["cam2scaled_%d" % (i)] = cam2scaled
+            cameras["intrinsics_%d" % (i)] = K
+
+        np.savez(output_dir / "cameras.npz", **cameras)
+
+        scene_box_params = {"min_vertices_scaled": min_vertices_scaled, "max_vertices_scaled": max_vertices_scaled}
+        np.savez(output_dir / "scene_box.npz", **scene_box_params)
+
+        CONSOLE.rule("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
+        return None
+
+
 Commands = Union[
     Annotated[ProcessImages, tyro.conf.subcommand(name="images")],
     Annotated[ProcessVideo, tyro.conf.subcommand(name="video")],
@@ -717,6 +885,7 @@ Commands = Union[
     Annotated[ProcessMetashape, tyro.conf.subcommand(name="metashape")],
     Annotated[ProcessInsta360, tyro.conf.subcommand(name="insta360")],
     Annotated[ProcessRecord3D, tyro.conf.subcommand(name="record3d")],
+    Annotated[ProcessKITTI360, tyro.conf.subcommand(name="kitti-360")],
 ]
 
 

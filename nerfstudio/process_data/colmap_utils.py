@@ -38,6 +38,7 @@ https://github.com/colmap/colmap/blob/1a4d0bad2e90aa65ce997c9d1779518eaed998d5/s
 import json
 import os
 import struct
+import urllib.request
 from dataclasses import dataclass
 from io import BufferedReader
 from pathlib import Path
@@ -676,3 +677,84 @@ def get_matching_summary(num_intial_frames: int, num_matched_frames: int) -> str
         result += " or large exposure changes."
         return result
     return f"[bold green]COLMAP found poses for {num_matched_frames / num_intial_frames * 100:.2f}% of the images."
+
+
+def run_colmap_with_known_camera_poses(
+    colmap_dir, recon_colmap_dir, image_dir, colmap_cmd, matching_method, verbose
+) -> None:
+    os.makedirs(recon_colmap_dir, exist_ok=True)
+    colmap_database_path = colmap_dir / "database.db"
+    if colmap_database_path.exists():
+        # Can't use missing_ok argument because of Python 3.7 compatibility.
+        colmap_database_path.unlink()
+
+    # Feature extraction
+    feature_extractor_cmd = [
+        f"{colmap_cmd} feature_extractor",
+        f"--database_path {colmap_dir / 'database.db'}",
+        f"--image_path {image_dir}",
+    ]
+    feature_extractor_cmd = " ".join(feature_extractor_cmd)
+    with status(msg="[bold yellow]Running COLMAP feature extractor...", spinner="moon", verbose=verbose):
+        run_command(feature_extractor_cmd, verbose=verbose)
+
+    CONSOLE.log("[bold green]:tada: Done extracting COLMAP features.")
+
+    # Feature matching
+    if matching_method == "vocab_tree":
+        matching_method = "vocab_tree_matcher"
+        vtree = "vocab_tree_flickr100K_words32k.bin"
+        if not os.path.isfile(colmap_dir / vtree):
+            urllib.request.urlretrieve(
+                "https://demuc.de/colmap/vocab_tree_flickr100K_words32K.bin", filename=colmap_dir / vtree
+            )
+        feature_matcher_cmd = [
+            f"{colmap_cmd} {matching_method}",
+            f"--database_path {colmap_dir / 'database.db'}",
+            f"--VocabTreeMatching.vocab_tree_path {colmap_dir / vtree}",
+        ]
+
+    elif matching_method == "exhaustive":
+        matching_method = "exhaustive_matcher"
+        # TODO(shwang) implement
+        raise NotImplementedError
+
+    elif matching_method == "sequential":
+        matching_method = "sequential_matcher"
+        # TODO(shwang) implement this part
+        raise NotImplementedError
+
+    feature_matcher_cmd = " ".join(feature_matcher_cmd)
+    with status(msg="[bold yellow]Running COLMAP feature matcher...", spinner="moon", verbose=verbose):
+        run_command(feature_matcher_cmd, verbose=verbose)
+
+    CONSOLE.log("[bold green]:tada: Done extracting COLMAP matcher.")
+
+    # Point Triangulations
+    point_triangulator_cmd = [
+        f"{colmap_cmd} point_triangulator",
+        f"--database_path {colmap_dir / 'database.db'}",
+        f"--image_path {image_dir}",
+        f"--input_path {colmap_dir}",
+        f"--output_path {recon_colmap_dir}",
+    ]
+    point_triangulator_cmd = " ".join(point_triangulator_cmd)
+    with status(msg="[bold yellow]Running COLMAP point triangulator...", spinner="moon", verbose=verbose):
+        run_command(point_triangulator_cmd, verbose=verbose)
+
+    CONSOLE.log("[bold green]:tada: Done conducting COLMAP point triangulations.")
+
+    # Model conversion
+    model_converter_cmd = [
+        f"{colmap_cmd} model_converter",
+        f"--input_path {recon_colmap_dir}",
+        f"--output_path {recon_colmap_dir}",
+        "--output_type TXT",
+    ]
+    model_converter_cmd = " ".join(model_converter_cmd)
+    with status(msg="[bold yellow]Converting binary types to txt files...", spinner="moon", verbose=verbose):
+        run_command(model_converter_cmd, verbose=verbose)
+
+    CONSOLE.log("[bold green]:tada: Done converting filetypes.")
+
+    return None
